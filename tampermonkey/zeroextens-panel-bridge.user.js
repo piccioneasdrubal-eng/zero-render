@@ -1,8 +1,9 @@
+/* eslint-disable */
 // ==UserScript==
 // @name         ZeroExtens Panel Bridge
 // @namespace    zeroextens
-// @version      1.0
-// @description  Collega il pannello web allo script ZeroExtens Bots PRO: inoltra i comandi via postMessage a window.gg e ne riporta lo stato.
+// @version      1.1
+// @description  Collega il pannello web al tuo script ZeroExtens Bots PRO: rileva automaticamente la connessione dello script e inoltra i comandi del pannello, riportandone lo stato.
 // @author       ZeroExtens
 // @match        *://agar.io/*
 // @match        *://www.agar.io/*
@@ -32,16 +33,45 @@
     return b;
   }
 
-  function gg() { return window.gg; }
+  // ── Rilevamento automatico dello script ──────────────────────────────
+  // Il tuo script può esporre la connessione con qualsiasi nome.
+  // 1) window.gg (convenzione predefinita)  2) window.__ZXPanelBridge.setConnection
+  // 3) eventuali globali elencate in CANDIDATES.
+  var CANDIDATES = ["gg", "ZeroExtens", "zx", "xevbots", "zxBots"];
 
-  // Invia un comando a window.gg. Ritorna true se la connessione è disponibile.
+  function gg() {
+    if (window.__ZXPanelConnection) return window.__ZXPanelConnection;
+    for (var i = 0; i < CANDIDATES.length; i++) {
+      var c = window[CANDIDATES[i]];
+      if (c && c.send) return c;
+    }
+    return null;
+  }
+
+  function connectedObj() {
+    var g = gg();
+    if (!g) return null;
+    // L'oggetto connessione può stare su g.ws o essere g stesso (se g è un WebSocket o simile)
+    if (g.ws) return g.ws;
+    if (typeof g.readyState !== "undefined") return g;
+    return null;
+  }
+
+  function isConnected() {
+    var ws = connectedObj();
+    if (!ws) return false;
+    // readyState 1 = OPEN. Se non esposto, assumiamo connesso se esiste window.gg.
+    return typeof ws.readyState === "undefined" ? true : ws.readyState === 1;
+  }
+
+  // Invia un comando alla connessione dello script. Ritorna true se disponibile.
   function exec(kind, payload) {
     var g = gg();
-    if (!g || !g.send || !g.ws || g.ws.readyState !== 1) return false;
+    if (!g || !g.send || !isConnected()) return false;
     var p = payload || {};
     switch (kind) {
       case "start": {
-        var srv = p.server || g.server || "";
+        var srv = p.server || (g.server) || "";
         var nm = p.name || (g.bots && g.bots.name) || "XEVBOT1";
         var amt = parseInt(p.amount, 10) || (g.bots && g.bots.amount) || 10;
         var body = [0].concat(encStr(srv)).concat(encStr(nm)).concat([amt & 255, amt >> 8]);
@@ -69,7 +99,7 @@
       type: "xev:status",
       ok: true,
       kind: kind,
-      connected: !!(g && g.ws && g.ws.readyState === 1),
+      connected: isConnected(),
       started: !!(g && g.bots && g.bots.started),
       name: (g && g.bots && g.bots.name) || "",
       amount: (g && g.bots && g.bots.amount) || 0
@@ -85,19 +115,33 @@
     if (!d || d.type !== "xev:cmd") return;
     if (d.kind === "ping") { status("ping"); return; }
     var ok = exec(d.kind, d.payload);
-    status(ok ? d.kind : "error", ok ? undefined : { msg: "Connessione al server non disponibile" });
+    status(ok ? d.kind : "error", ok ? undefined : { msg: "Connessione dello script non disponibile" });
   });
 
-  // Annuncia la presenza finché window.gg non è pronto
+  // Espone un punto di aggancio per il tuo script: chiama
+  //   window.__ZXPanelBridge.setConnection(oggettoConnessione)
+  // per fargli dichiarare la propria connessione (utile se non usa window.gg).
+  window.__ZXPanelBridge = {
+    setConnection: function (obj) {
+      window.__ZXPanelConnection = obj;
+      LOG("Connessione registrata dal tuo script");
+      status("hello");
+    },
+    send: exec,
+    isConnected: isConnected
+  };
+
+  // Annuncia la presenza finché lo script non è pronto
   var tries = 0;
   var t = setInterval(function () {
     tries++;
-    if (gg() && gg().ws) {
+    if (gg()) {
       clearInterval(t);
-      LOG("window.gg pronto");
+      LOG("Script rilevato (" + (window.__ZXPanelConnection ? "connessione registrata" : "window.gg") + ")");
       status("hello");
     } else if (tries > 400) {
       clearInterval(t);
+      LOG("Nessuno script rilevato. Avvia ZeroExtens Bots PRO nella pagina.");
     }
   }, 250);
 })();
