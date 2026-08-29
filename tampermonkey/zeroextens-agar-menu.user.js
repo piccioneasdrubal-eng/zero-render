@@ -2,7 +2,7 @@
 // ==UserScript==
 // @name         ZeroExtens Agar Menu
 // @namespace    zeroextens
-// @version      1.4
+// @version      1.5
 // @description  Menu di controllo bot per agar.io: pannello collassato a sinistra con pulsante apri/chiudi, avvia/ferma, numero e nome bot, split, feed, vshield, modalità AI follow/farming con tasto rapido custom, salvataggio e autosave. Riceve anche i comandi dal pannello web.
 // @author       ZeroExtens
 // @match        *://agar.io/*
@@ -118,7 +118,26 @@
       msg = $("zx-msg"), panel = $("zx-panel"), tab = $("zx-tab"),
       tabarrow = $("zx-tabarrow"), tabdot = $("zx-tabdot");
 
+  // Mantiene il menu in pagina (agar.io ricostruisce il DOM)
+  function reattach() {
+    if (root.isConnected) return;
+    var host = document.body || document.documentElement;
+    try { host.appendChild(root); } catch (e) {}
+  }
+  // Legge un valore senza errore: se il menu è momentaneamente staccato usa il fallback.
+  function val(id, fallback) {
+    var el = $(id);
+    return el ? el.value : fallback;
+  }
+  function checked(id, fallback) {
+    var el = $(id);
+    return el ? el.checked : !!fallback;
+  }
+  // Modalità di connessione senza errore se il menu è staccato
+  function mode() { return val("zx-mode", (savedVals().mode || "server")); }
+
   function setCollapsed(c) {
+    reattach();
     collapsed = c;
     panel.style.display = c ? "none" : "block";
     tabarrow.textContent = c ? "◀" : "▶";
@@ -207,18 +226,20 @@
     flashTimer = setTimeout(function () { msg.textContent = ""; }, 2600);
   }
   function btnLabel() {
-    if (state.connected) return $("zx-mode").value === "script" ? "Scollega" : "Disconnetti";
-    return $("zx-mode").value === "script" ? "Collega" : "Connetti";
+    if (state.connected) return mode() === "script" ? "Scollega" : "Disconnetti";
+    return mode() === "script" ? "Collega" : "Connetti";
   }
   function setState(connected) {
+    reattach();
     state.connected = connected;
     dot.style.background = connected ? "#3fb950" : "#f85149";
     dot.style.boxShadow = connected ? "0 0 8px #3fb950" : "0 0 8px #f85149";
     tabdot.style.background = connected ? "#3fb950" : "#f85149";
     tabdot.style.boxShadow = connected ? "0 0 8px #3fb950" : "0 0 8px #f85149";
-    $("zx-state").textContent = connected ? "connesso" : "offline";
-    $("zx-state").style.color = connected ? "#7ee787" : "#8b949e";
-    $("zx-connect").textContent = btnLabel();
+    var st = $("zx-state");
+    if (st) { st.textContent = connected ? "connesso" : "offline"; st.style.color = connected ? "#7ee787" : "#8b949e"; }
+    var cn = $("zx-connect");
+    if (cn) cn.textContent = btnLabel();
   }
   function paintVshield() {
     $("zx-vshield").style.background = state.vshield ? "#9e6a03" : "#30363d";
@@ -239,7 +260,7 @@
   }
 
   function send(data) {
-    if ($("zx-mode").value === "script") {
+    if (mode() === "script") {
       if (!scriptConnected()) { flash("Script di gioco non collegato", "#f85149"); return false; }
       scriptGG().send(data);
       return true;
@@ -250,7 +271,7 @@
   }
 
   function connect() {
-    if ($("zx-mode").value === "script") {
+    if (mode() === "script") {
       if (state.connected) { setState(false); flash("Scollegato dallo script (lo script resta attivo)"); return; }
       if (scriptConnected()) { setState(true); flash("Connesso tramite lo script di gioco"); if (readForm().auto) save(); return; }
       flash("Script di gioco non attivo: installa ZeroExtens Bots PRO", "#f85149");
@@ -301,7 +322,7 @@
   });
   ["zx-ctrl", "zx-auto", "zx-mode"].forEach(function (id) {
     $(id).addEventListener("change", function () {
-      if (id === "zx-mode") { $("zx-connect").textContent = btnLabel(); if (state.connected && $("zx-mode").value === "script" && !scriptConnected()) setState(false); }
+      if (id === "zx-mode") { $("zx-connect").textContent = btnLabel(); if (state.connected && mode() === "script" && !scriptConnected()) setState(false); }
       if (readForm().auto) save();
     });
   });
@@ -323,7 +344,7 @@
 
   // Aggiorna lo stato in base alla modalità
   setInterval(function () {
-    var on = $("zx-mode").value === "script" ? scriptConnected() : !!(ws && ws.readyState === 1);
+    var on = mode() === "script" ? scriptConnected() : !!(ws && ws.readyState === 1);
     if (on !== state.connected) setState(on);
   }, 1000);
 
@@ -389,12 +410,7 @@
     menuExec(d.kind, d.payload);
   });
 
-  // Mantiene il menu in pagina (agar.io ricostruisce il DOM)
-  function reattach() {
-    if (root.isConnected) return;
-    var host = document.body || document.documentElement;
-    try { host.appendChild(root); } catch (e) {}
-  }
+  // Mantiene il menu in pagina: reattach() è definito sopra. Interval + observer qui.
   setInterval(reattach, 800);
   if (window.MutationObserver) {
     var mo = new MutationObserver(reattach);
