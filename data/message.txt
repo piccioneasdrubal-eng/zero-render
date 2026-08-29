@@ -1,0 +1,781 @@
+// ==UserScript==
+// @name         Dumb userscript 2 (patched)
+// @namespace    dwdwdwdwd
+// @version      896.1
+// @description  Player tracker with permanent retention, search, online filter toggle, copy-all visible names, VIP highlights, dual active/total counter, minimize, sorting, peak mass, JSON export, and local storage persistence (patched: safer webpack probe, removed auto-clear on WebSocket, imgur fixes, shorter poll)
+// @match        *://*.agar.io/*
+// @match        *://*.delt.io/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const SCRIPT_DELAY = 6000;
+  const POLL_INTERVAL = 3000; // lowered from 1000000 for more responsive UI
+  const STORAGE_KEY = 'agar_player_tracker_data_v4';
+
+  let searchTerm = '';
+  let sortMode = 'mass'; // 'mass', 'name', 'peak'
+  let isMinimized = false;
+  let showOnlineOnly = false;
+  let currentRenderedPlayers = [];
+  const persistentPlayerMap = new Map();
+
+  // Load persisted data from localStorage on startup
+  try {
+    const savedData = localStorage.getItem(STORAGE_KEY);
+    if (savedData) {
+      const parsed = JSON.parse(savedData);
+      parsed.forEach(([key, val]) => persistentPlayerMap.set(key, val));
+      console.log(`[Tracker] Loaded ${persistentPlayerMap.size} players from localStorage.`);
+    }
+  } catch (e) {
+    console.warn('[Tracker] Failed to load localStorage data:', e);
+  }
+
+  function saveTrackerToStorage() {
+    try {
+      const arr = Array.from(persistentPlayerMap.entries());
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(arr));
+    } catch (e) {
+      console.warn('[Tracker] Failed to save localStorage data:', e);
+    }
+  }
+
+  // --- WebSocket proxy for server switches -----------------
+  // NOTE: automatic clearing on every WebSocket construction was removed to avoid
+  // unintended data loss. Manual reset remains via window.__texClear() and UI reset button.
+  const _OrigWebSocket = window.WebSocket;
+  if (typeof _OrigWebSocket === 'function') {
+    const ProxiedWebSocket = new Proxy(_OrigWebSocket, {
+      construct(target, args) {
+        try {
+          // Detect a new connection attempt; do NOT automatically clear storage.
+          const tex = window.__texObjRef;
+          if (tex && tex.customSkinMap && typeof tex.customSkinMap.clear === 'function') {
+            // Only log detection; user can manually clear via the UI/reset button.
+            console.log('[Tracker] new WebSocket created — detected tex obj, not clearing storage automatically.');
+          }
+        } catch (e) { /* ignore */ }
+        // Use Reflect.construct to preserve behavior
+        return Reflect.construct(target, args);
+      }
+    });
+    try { window.WebSocket = ProxiedWebSocket; } catch (e) {}
+  }
+
+  setTimeout(init, SCRIPT_DELAY);
+
+  let _texObj = null;
+  let _webpackReq = null;
+
+  function looksLikeTex(v) {
+    if (!v || typeof v !== 'object') return false;
+    try { return v.customSkinMap instanceof Map; } catch (e) { return false; }
+  }
+
+  function getWebpackRequire() {
+    if (_webpackReq && _webpackReq.m) return _webpackReq;
+    const chunkKeyCandidates = Object.keys(window).filter(k => /^webpackChunk/.test(k));
+    for (const key of chunkKeyCandidates) {
+      try {
+        const arr = window[key];
+        if (!arr || typeof arr.push !== 'function') continue;
+
+        // Create a unique probe entry so we can always remove it afterwards.
+        const probeRuntime = (req) => { captured = req; };
+        const probe = [[Symbol('probe')], {}, probeRuntime];
+        let captured = null;
+
+        try {
+          arr.push(probe);
+          // pushing the probe will cause webpack to call the runtime (where we capture)
+          // If captured is populated, it exposes 'm' (modules)
+          if (captured && captured.m) { _webpackReq = captured; return captured; }
+        } catch (e) {
+          // ignore failures while pushing probe
+        } finally {
+          // Remove our probe entry to avoid leaving spurious data in the chunk array.
+          try {
+            const idx = arr.indexOf(probe);
+            if (idx !== -1) arr.splice(idx, 1);
+          } catch (er) { /* ignore cleanup errors */ }
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  function scanWebpackModulesForTex() {
+    const req = getWebpackRequire();
+    if (!req || !req.m) return null;
+    const ids = Object.keys(req.m);
+    for (const id of ids) {
+      let exp;
+      try { exp = req(id); } catch (e) { continue; }
+      if (!exp) continue;
+      if (looksLikeTex(exp)) return exp;
+      if (typeof exp === 'object') {
+        let sub = [];
+        try { sub = Object.keys(exp); } catch (e) { continue; }
+        if (sub.length > 30) continue;
+        for (const k of sub) {
+          let v;
+          try { v = exp[k]; } catch (e) { continue; }
+          if (looksLikeTex(v)) return v;
+        }
+      }
+    }
+    return null;
+  }
+
+  function findTex() {
+    if (_texObj && looksLikeTex(_texObj)) return _texObj;
+    if (looksLikeTex(window.Texture)) { _texObj = window.Texture; window.__texObjRef = _texObj; return window.Texture; }
+    let keys = [];
+    try { keys = Object.keys(window); } catch (e) {}
+    for (const k of keys) {
+      let v;
+      try { v = window[k]; } catch (e) { continue; }
+      if (looksLikeTex(v)) { _texObj = v; window.__texObjRef = _texObj; return v; }
+    }
+    for (const k of keys) {
+      let v;
+      try { v = window[k]; } catch (e) { continue; }
+      if (!v || typeof v !== 'object') continue;
+      if (v instanceof Node || v instanceof Window) continue;
+      let sub = [];
+      try { sub = Object.keys(v); } catch (e) { continue; }
+      if (sub.length > 50) continue;
+      for (const k2 of sub) {
+        let v2;
+        try { v2 = v[k2]; } catch (e) { continue; }
+        if (looksLikeTex(v2)) { _texObj = v2; window.__texObjRef = _texObj; return v2; }
+      }
+    }
+    const fromWebpack = scanWebpackModulesForTex();
+    if (fromWebpack) { _texObj = fromWebpack; window.__texObjRef = _texObj; return fromWebpack; }
+    return null;
+  }
+
+  window.__texClear = function () {
+    const t = findTex();
+    if (t && t.customSkinMap && typeof t.customSkinMap.clear === 'function') {
+      t.customSkinMap.clear();
+    }
+    persistentPlayerMap.clear();
+    localStorage.removeItem(STORAGE_KEY);
+    console.log('[Tracker] manually cleared skin data and local storage');
+    return true;
+  };
+
+  function stripTrailingDigits(str) {
+    return String(str).replace(/\d+$/, '').trim();
+  }
+
+  function fixImageUrl(url) {
+    if (!url) return url;
+    url = String(url).trim();
+    // Strip query/hash
+    url = url.split(/[?#]/)[0];
+
+    // Support protocol-relative URLs
+    if (url.startsWith('//')) url = 'https:' + url;
+
+    // Ensure https
+    if (url.startsWith('http://')) url = url.replace('http://', 'https://');
+
+    // Imgur normalization: support i.imgur.com, imgur.com/{id}, imgur.com/a/{album}, gallery
+    try {
+      const hostMatch = url.match(/(?:https?:\/\/)?(?:i\.)?imgur\.com\/(.+)$/i);
+      if (hostMatch) {
+        const tail = hostMatch[1].replace(/\/+$/, '');
+        // If it's an album/gallery, try to extract last segment (album id won't map to direct image but we try)
+        const simpleIdMatch = tail.match(/(?:a\/|gallery\/)?([a-zA-Z0-9]+)(?:\.[a-z]+)?$/);
+        if (simpleIdMatch) {
+          return `https://i.imgur.com/${simpleIdMatch[1]}.png`;
+        }
+      }
+    } catch (e) { /* ignore URL parsing errors */ }
+
+    // If still starts with http(s) or data: leave as-is (after https normalization)
+    return url;
+  }
+
+  // --- Active Player Scanner with Status & Retention ----------------------
+  function getActivePlayers() {
+    let cells = null;
+    try {
+      if (window.cells && Array.isArray(window.cells)) {
+        cells = window.cells;
+      } else if (window.application && typeof window.application.getCells === 'function') {
+        cells = window.application.getCells();
+      } else if (window.core && Array.isArray(window.core.cells)) {
+        cells = window.core.cells;
+      } else if (window.agar && Array.isArray(window.agar.allCells)) {
+        cells = window.agar.allCells;
+      }
+    } catch (e) { /* safe fallback */ }
+
+    const tex = findTex();
+    const csm = tex && tex.customSkinMap;
+
+    if (cells && Array.isArray(cells) && cells.length > 0) {
+      cells.forEach(c => {
+        if (!c) return;
+        const name = c.name || c.n || c.nick;
+        if (!name) return;
+        if (c.isVirus || c.virus || c.isFood || c.food) return;
+
+        const size = c.size || c.s || 0;
+        const mass = c.mass || c.m || (size > 0 ? Math.floor((size * size) / 100) : 0);
+        const x = c.x || 0;
+        const y = c.y || 0;
+
+        let skinURL = c.skinURL || c.skin || c.customSkin || '';
+        if (!skinURL && csm && csm.has(name)) {
+          const inner = csm.get(name);
+          if (inner instanceof Map) {
+            inner.forEach(u => { if (!skinURL) skinURL = u; });
+          }
+        }
+        skinURL = fixImageUrl(skinURL);
+
+        if (!persistentPlayerMap.has(name)) {
+          persistentPlayerMap.set(name, {
+            id: name,
+            name: stripTrailingDigits(name) || name,
+            skinURL: skinURL,
+            totalMass: mass,
+            sumX: x,
+            sumY: y,
+            cellCount: 1,
+            lastMass: mass,
+            lastX: x,
+            lastY: y,
+            peakMass: mass
+          });
+        } else {
+          const p = persistentPlayerMap.get(name);
+          p.totalMass += mass;
+          p.sumX += x;
+          p.sumY += y;
+          p.cellCount += 1;
+          if (!p.skinURL && skinURL) p.skinURL = skinURL;
+          if (mass > p.peakMass) p.peakMass = mass;
+        }
+      });
+    }
+
+    if (csm && typeof csm.forEach === 'function') {
+      try {
+        csm.forEach((innerMap, playerName) => {
+          if (!(innerMap instanceof Map)) return;
+          let skinURL = '';
+          innerMap.forEach(url => { if (!skinURL) skinURL = fixImageUrl(url); });
+          if (!skinURL) return;
+
+          if (!persistentPlayerMap.has(playerName)) {
+            persistentPlayerMap.set(playerName, {
+              id: playerName,
+              name: stripTrailingDigits(playerName) || playerName,
+              skinURL: skinURL,
+              totalMass: 0,
+              sumX: 0,
+              sumY: 0,
+              cellCount: 0,
+              lastMass: '???',
+              lastX: '?',
+              lastY: '?',
+              peakMass: 0
+            });
+          } else {
+            const p = persistentPlayerMap.get(playerName);
+            if (!p.skinURL && skinURL) p.skinURL = skinURL;
+          }
+        });
+      } catch (e) { /* safe iteration */ }
+    }
+
+    const players = [];
+    persistentPlayerMap.forEach((p) => {
+      let finalMass;
+      let avgX;
+      let avgY;
+      let isActiveNow = (p.cellCount > 0);
+
+      if (isActiveNow) {
+        avgX = Math.round(p.sumX / p.cellCount);
+        avgY = Math.round(p.sumY / p.cellCount);
+        finalMass = p.totalMass;
+
+        p.lastMass = finalMass;
+        p.lastX = avgX;
+        p.lastY = avgY;
+        if (finalMass > p.peakMass) p.peakMass = finalMass;
+      } else {
+        finalMass = p.lastMass !== undefined ? p.lastMass : '???';
+        avgX = p.lastX !== undefined ? p.lastX : '?';
+        avgY = p.lastY !== undefined ? p.lastY : '?';
+      }
+
+      players.push({
+        id: p.id,
+        name: p.name,
+        skinURL: p.skinURL || '',
+        mass: finalMass,
+        peakMass: p.peakMass,
+        x: avgX,
+        y: avgY,
+        isActiveNow: isActiveNow
+      });
+
+      p.totalMass = 0;
+      p.sumX = 0;
+      p.sumY = 0;
+      p.cellCount = 0;
+    });
+
+    saveTrackerToStorage();
+
+    players.sort((a, b) => {
+      if (sortMode === 'name') {
+        return a.name.localeCompare(b.name);
+      } else if (sortMode === 'peak') {
+        const pA = typeof a.peakMass === 'number' ? a.peakMass : -1;
+        const pB = typeof b.peakMass === 'number' ? b.peakMass : -1;
+        return pB - pA;
+      } else {
+        const mA = typeof a.mass === 'number' ? a.mass : -1;
+        const mB = typeof b.mass === 'number' ? b.mass : -1;
+        return mB - mA;
+      }
+    });
+
+    return players;
+  }
+
+  // --- Export Functionality -----------------------------------------------
+  function exportTrackerData() {
+    const players = [];
+    persistentPlayerMap.forEach((p) => {
+      players.push({
+        id: p.id,
+        name: p.name,
+        skinURL: p.skinURL,
+        lastMass: p.lastMass,
+        peakMass: p.peakMass,
+        lastX: p.lastX,
+        lastY: p.lastY
+      });
+    });
+
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(players, null, 2));
+    const downloadAnchor = document.createElement('a');
+    downloadAnchor.setAttribute("href", dataStr);
+    downloadAnchor.setAttribute("download", `agar_players_${Date.now()}.json`);
+    document.body.appendChild(downloadAnchor);
+    downloadAnchor.click();
+    downloadAnchor.remove();
+  }
+
+  // --- UI Setup & Features Integration ------------------------------------
+  function init() {
+    console.log('Player Tracker initialized with copy-all feature & dual counter.');
+    const overlay = createOverlay();
+    const listEl = overlay.querySelector('#player-tracker-list');
+    const searchInput = overlay.querySelector('#player-search-input');
+    const sortSelect = overlay.querySelector('#player-sort-select');
+    const countBadge = overlay.querySelector('#player-count-badge');
+    const minimizeBtn = overlay.querySelector('#player-minimize-btn');
+    const exportBtn = overlay.querySelector('#player-export-btn');
+    const copyAllBtn = overlay.querySelector('#player-copy-all-btn');
+    const onlineFilterBtn = overlay.querySelector('#player-online-filter-btn');
+
+    minimizeBtn.addEventListener('click', () => {
+      isMinimized = !isMinimized;
+      listEl.style.display = isMinimized ? 'none' : 'flex';
+      minimizeBtn.textContent = isMinimized ? '+' : '−';
+    });
+
+    onlineFilterBtn.addEventListener('click', () => {
+      showOnlineOnly = !showOnlineOnly;
+      onlineFilterBtn.textContent = showOnlineOnly ? '👁️ Online' : '👁️ All';
+      onlineFilterBtn.style.background = showOnlineOnly ? 'rgba(76, 175, 80, 0.4)' : 'rgba(255, 255, 255, 0.15)';
+      update();
+    });
+
+    copyAllBtn.addEventListener('click', () => {
+      if (!currentRenderedPlayers.length) return;
+      const allNames = currentRenderedPlayers.map(p => p.name).join(', ');
+      navigator.clipboard.writeText(allNames).then(() => {
+        copyAllBtn.textContent = '✅';
+        setTimeout(() => { copyAllBtn.textContent = '📋'; }, 800);
+      }).catch(() => {});
+    });
+
+    searchInput.addEventListener('input', (e) => {
+      searchTerm = e.target.value.toLowerCase().trim();
+      update();
+    });
+
+    sortSelect.addEventListener('change', (e) => {
+      sortMode = e.target.value;
+      update();
+    });
+
+    exportBtn.addEventListener('click', () => {
+      exportTrackerData();
+    });
+
+    function update() {
+      let players = getActivePlayers();
+      const activeCount = players.filter(pl => pl.isActiveNow).length;
+
+      if (showOnlineOnly) {
+        players = players.filter(pl => pl.isActiveNow);
+      }
+
+      if (searchTerm) {
+        players = players.filter(pl => pl.name.toLowerCase().includes(searchTerm) || pl.id.toLowerCase().includes(searchTerm));
+      }
+
+      currentRenderedPlayers = players;
+      countBadge.textContent = `${activeCount} / ${persistentPlayerMap.size}`;
+
+      renderList(listEl, players);
+    }
+
+    update();
+    setInterval(update, POLL_INTERVAL);
+  }
+
+  function createOverlay() {
+    const overlay = document.createElement('div');
+    overlay.id = 'player-tracker-overlay';
+    overlay.style.cssText = `
+      position: fixed;
+      top: 50%;
+      right: 10px;
+      transform: translateY(-50%);
+      z-index: 99999;
+      pointer-events: none;
+      font-family: 'Ubuntu', Arial, sans-serif;
+      color: #ffffff;
+    `;
+
+    const topBar = document.createElement('div');
+    topBar.style.cssText = `
+      display: flex;
+      gap: 4px;
+      margin-bottom: 4px;
+      align-items: center;
+      pointer-events: auto;
+    `;
+
+    const searchBox = document.createElement('input');
+    searchBox.id = 'player-search-input';
+    searchBox.type = 'text';
+    searchBox.placeholder = 'Filter players...';
+    searchBox.style.cssText = `
+      flex: 1;
+      background: rgba(0, 0, 0, 0.6);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 4px;
+      color: #fff;
+      font-size: 10px;
+      padding: 3px 6px;
+      outline: none;
+    `;
+    topBar.appendChild(searchBox);
+
+    const onlineFilterBtn = document.createElement('button');
+    onlineFilterBtn.id = 'player-online-filter-btn';
+    onlineFilterBtn.textContent = '👁️ All';
+    onlineFilterBtn.title = 'Toggle: Show All vs Only Online';
+    onlineFilterBtn.style.cssText = `
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 10px;
+      padding: 3px 5px;
+    `;
+    topBar.appendChild(onlineFilterBtn);
+
+    const sortSelect = document.createElement('select');
+    sortSelect.id = 'player-sort-select';
+    sortSelect.title = 'Sort players by';
+    sortSelect.style.cssText = `
+      background: rgba(0, 0, 0, 0.7);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 4px;
+      color: #fff;
+      font-size: 10px;
+      padding: 2px 3px;
+      outline: none;
+      cursor: pointer;
+    `;
+    sortSelect.innerHTML = `
+      <option value="mass">Mass</option>
+      <option value="peak">Peak</option>
+      <option value="name">Name</option>
+    `;
+    topBar.appendChild(sortSelect);
+
+    const countBadge = document.createElement('div');
+    countBadge.id = 'player-count-badge';
+    countBadge.title = 'Active (Online) / Total Cached Players';
+    countBadge.textContent = '0 / 0';
+    countBadge.style.cssText = `
+      background: rgba(255, 255, 255, 0.15);
+      color: #ffcc00;
+      font-size: 10px;
+      font-weight: bold;
+      padding: 3px 5px;
+      border-radius: 4px;
+      text-align: center;
+      min-width: 32px;
+    `;
+    topBar.appendChild(countBadge);
+
+    const copyAllBtn = document.createElement('button');
+    copyAllBtn.id = 'player-copy-all-btn';
+    copyAllBtn.textContent = '📋';
+    copyAllBtn.title = 'Copy all visible player names to clipboard';
+    copyAllBtn.style.cssText = `
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 11px;
+      padding: 2px 5px;
+    `;
+    topBar.appendChild(copyAllBtn);
+
+    const exportBtn = document.createElement('button');
+    exportBtn.id = 'player-export-btn';
+    exportBtn.textContent = '📥';
+    exportBtn.title = 'Export tracked players to JSON';
+    exportBtn.style.cssText = `
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 11px;
+      padding: 2px 5px;
+    `;
+    topBar.appendChild(exportBtn);
+
+    const minimizeBtn = document.createElement('button');
+    minimizeBtn.id = 'player-minimize-btn';
+    minimizeBtn.textContent = '−';
+    minimizeBtn.title = 'Minimize / Expand Tracker';
+    minimizeBtn.style.cssText = `
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: bold;
+      padding: 2px 6px;
+    `;
+    topBar.appendChild(minimizeBtn);
+
+    const resetBtn = document.createElement('button');
+    resetBtn.textContent = '⟳';
+    resetBtn.title = 'Clear player list, storage & skin data';
+    resetBtn.style.cssText = `
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 11px;
+      padding: 2px 6px;
+    `;
+    resetBtn.addEventListener('click', () => { window.__texClear(); });
+    topBar.appendChild(resetBtn);
+
+    overlay.appendChild(topBar);
+
+    const list = document.createElement('div');
+    list.id = 'player-tracker-list';
+    list.style.cssText = `
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 4px;
+      padding: 6px 8px;
+      background: rgba(0, 0, 0, 0.65);
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
+      width: 335px;
+      max-height: 80vh;
+      overflow-y: auto;
+      overflow-x: hidden;
+      pointer-events: auto;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255, 255, 255, 0.4) transparent;
+    `;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #player-tracker-list::-webkit-scrollbar { width: 6px; }
+      #player-tracker-list::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.08); border-radius: 3px; }
+      #player-tracker-list::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.4); border-radius: 3px; }
+      #player-tracker-list::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.6); }
+    `;
+    document.head.appendChild(style);
+
+    overlay.appendChild(list);
+    document.body.appendChild(overlay);
+    return overlay;
+  }
+
+  function renderList(container, players) {
+    if (!container) return;
+    container.innerHTML = '';
+
+    if (!players.length) {
+      const empty = document.createElement('div');
+      empty.textContent = 'No players found';
+      empty.style.fontSize = '12px';
+      empty.style.opacity = '0.7';
+      empty.style.textAlign = 'center';
+      empty.style.padding = '8px 0';
+      container.appendChild(empty);
+      return;
+    }
+
+    players.forEach((pl) => {
+      const isVIP = typeof pl.peakMass === 'number' && pl.peakMass >= 2500;
+      const item = document.createElement('div');
+      item.title = `Click to copy name: ${pl.name} | Peak Mass: ${pl.peakMass} | Status: ${pl.isActiveNow ? 'Online' : 'Cached'}`;
+      item.style.cssText = `
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        padding: 3px 4px;
+        border-radius: 4px;
+        font-size: 11px;
+        text-align: left;
+        gap: 6px;
+        background: ${isVIP ? 'rgba(255, 204, 0, 0.08)' : 'rgba(255, 255, 255, 0.03)'};
+        cursor: pointer;
+        transition: background 0.2s, border-color 0.2s;
+        border: 1px solid ${isVIP ? 'rgba(255, 204, 0, 0.4)' : 'transparent'};
+      `;
+      item.addEventListener('mouseenter', () => { item.style.background = isVIP ? 'rgba(255, 204, 0, 0.15)' : 'rgba(255, 255, 255, 0.08)'; });
+      item.addEventListener('mouseleave', () => { item.style.background = isVIP ? 'rgba(255, 204, 0, 0.08)' : 'rgba(255, 255, 255, 0.03)'; });
+
+      // Click to copy name functionality
+      item.addEventListener('click', () => {
+        navigator.clipboard.writeText(pl.name).then(() => {
+          item.style.borderColor = '#4CAF50';
+          setTimeout(() => { item.style.borderColor = isVIP ? 'rgba(255, 204, 0, 0.4)' : 'transparent'; }, 600);
+        }).catch(() => {});
+      });
+
+      const leftGroup = document.createElement('div');
+      leftGroup.style.cssText = `
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: 1;
+        min-width: 0;
+      `;
+
+      // Status Indicator Dot & Avatar Wrap
+      const imgWrap = document.createElement('div');
+      imgWrap.style.cssText = `
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.1);
+        flex-shrink: 0;
+        position: relative;
+      `;
+
+      const statusDot = document.createElement('div');
+      statusDot.style.cssText = `
+        position: absolute;
+        bottom: 0;
+        right: 0;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background-color: ${pl.isActiveNow ? '#4CAF50' : '#888888'};
+        border: 1px solid #000000;
+        z-index: 2;
+      `;
+
+      const img = document.createElement('img');
+      img.src = pl.skinURL;
+      img.style.cssText = `
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        image-rendering: auto;
+        image-rendering: crisp-edges;
+        image-rendering: pixelated;
+      `;
+      img.onerror = () => {
+        imgWrap.textContent = '?';
+        imgWrap.style.display = 'flex';
+        imgWrap.style.alignItems = 'center';
+        imgWrap.style.justifyContent = 'center';
+        imgWrap.style.fontSize = '16px';
+        imgWrap.style.color = '#aaaaaa';
+      };
+      imgWrap.appendChild(img);
+      imgWrap.appendChild(statusDot);
+
+      const nameDiv = document.createElement('div');
+      nameDiv.textContent = pl.name || 'Unnamed';
+      nameDiv.style.cssText = `
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-weight: ${isVIP ? 'bold' : 'normal'};
+        color: ${isVIP ? '#ffeb3b' : '#ffffff'};
+      `;
+
+      leftGroup.appendChild(imgWrap);
+      leftGroup.appendChild(nameDiv);
+
+      const statsDiv = document.createElement('div');
+      statsDiv.style.cssText = `
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        font-size: 10px;
+        color: #b3b3b3;
+        flex-shrink: 0;
+        min-width: 65px;
+      `;
+
+      const massSpan = document.createElement('span');
+      massSpan.style.cssText = `color: #ffcc00; font-weight: bold;`;
+      massSpan.textContent = `M: ${pl.mass} (P:${pl.peakMass})`;
+
+      const coordsSpan = document.createElement('span');
+      coordsSpan.textContent = `X:${pl.x} Y:${pl.y}`;
+
+      statsDiv.appendChild(massSpan);
+      statsDiv.appendChild(coordsSpan);
+
+      item.appendChild(leftGroup);
+      item.appendChild(statsDiv);
+      container.appendChild(item);
+    });
+  }
+})();
