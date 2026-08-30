@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 // INSERISCI QUI IL PERCORSO COMPLETO O RELATIVO DEL FILE DA ELIMINARE
-const targetFilePath = path.join(__dirname, 'boost.txt');
+const targetFilePath = path.join(__dirname, 'boost');
 
 console.log(`[Monitoraggio Continuo Avviato] Controllo attivo su: ${targetFilePath}`);
 
